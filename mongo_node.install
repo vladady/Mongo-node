@@ -1,0 +1,28 @@
+<?php
+
+/**
+ * @file
+ * Install function for adding autoincrement values for entity types and bundles
+ */
+
+/**
+ * Implements hook_install().
+ */
+function mongo_node_install() {
+  $module_name = 'mongo_node';
+  $path = drupal_get_path('module', 'mongo_node');
+
+  $settings_file = $path . '/' . $module_name . '.conf.php';
+  if (file_exists($settings_file)) {
+    include $settings_file;
+  }
+  foreach ($settings as $entity_type_name => $entity) {
+    $collection = mongodb_collection($entity_type_name . '_ids');
+    $collection->insert(
+      array(
+        'type' => $entity_type_name,
+        'c' => 1,
+      )
+    );
+  }
+}

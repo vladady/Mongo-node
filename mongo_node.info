@@ -1,0 +1,10 @@
+name = Mongo Node
+description = Mongo node
+
+core = 7.x
+
+dependencies[] = entity
+dependencies[] = mongodb
+;dependencies[] = mongodb_field_storage
+
+files[] = mongo_node.controller.inc

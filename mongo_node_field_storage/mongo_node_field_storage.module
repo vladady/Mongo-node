@@ -1,0 +1,269 @@
+<?php
+
+/**
+ * @file
+ * Implementation of the field storage API for MongoDB.
+ */
+
+/**
+ * Implements hook_field_storage_info().
+ */
+function mongo_node_field_storage_field_storage_info() {
+  return array(
+    'mongo_node_field_storage' => array(
+      'label' => t('Mongo node field storage'),
+      'description' => t('Stores entities and fields in a MongoDB database.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_storage_details().
+ */
+function mongo_node_field_storage_field_storage_details($field) {
+  // We probably want to implement that at one point, but this is informative only.
+}
+
+/**
+ * Implements hook_field_storage_create_field().
+ */
+function mongo_node_field_storage_field_storage_create_field($field) {
+  // Nothing to do?
+}
+
+/**
+ * Implements hook_field_storage_update_field().
+ */
+function mongo_node_field_storage_field_storage_update_field($field, $prior_field, $has_data) {
+  //if (!$has_data) {
+    // There is no data. Re-create the tables completely.
+  $prior_schema = _field_sql_storage_schema($prior_field);
+  foreach ($prior_schema as $name => $table) {
+    db_drop_table($name, $table);
+  }
+  //}
+  $schema = _field_sql_storage_schema($field);
+  foreach ($schema as $name => $table) {
+   // db_create_table($name, $table);
+    if(strstr($name, 'field_data_')){
+      $name = str_replace('field_data_', '', $name);
+      db_update('field_config')->fields(array(
+        'storage_type' => 'mongo_node_field_storage',
+        'storage_module' => 'mongo_node_field_storage',
+      ))
+      ->condition('field_name', $name)
+      ->execute();
+    }
+  }
+  drupal_get_schema(NULL, TRUE);
+}
+/**
+ * Implements hook_field_storage_delete_field().
+ */
+function mongo_node_field_storage_field_storage_delete_field($field) {
+  // Nothing to do?
+}
+
+/**
+ * Implements hook_field_storage_load().
+ */
+function mongo_node_field_storage_field_storage_load($entity_type, $entities, $age, $fields, $options) {
+  $entity_info = entity_get_info($entity_type);
+  if (!isset($entity_info['base table'])) {
+    return;
+  }
+
+  $load_current = $age == FIELD_LOAD_CURRENT;
+
+  // Fetch information about the fields and prepare the keys.
+  $keys = array();
+  $field_names = array();
+  $saved_fields = array();
+  foreach ($fields as $field_id => $ids) {
+    $field = field_info_field_by_id($field_id);
+    $saved_fields[$field_id] = $field;
+
+    // Add this fields' id to the list.
+    foreach ($ids as $id) {
+      $keys[$id] = TRUE;
+    }
+  }
+
+  // Execute the query and save the fields to the parent object.
+  $collection = mongodb_collection($load_current ? 'fields_current' : 'fields_revision', $entity_type);
+  $result = $collection->find(array('_id' => array('$in' => array_keys($keys))));
+
+  foreach ($result as $row) {
+    if (isset($row['nid'])) {
+      $entity_id = $row['nid'];
+    }
+    else {
+      $entity_id = $row['_id'];
+    }
+    foreach ($saved_fields as $field_id => $field) {
+      $field_name = $field['field_name'];
+      $field_values = array();
+      if (!empty($row[$field_name])) {
+        // Restore the field structure.
+        if ($field['cardinality'] == 1) {
+          $language = isset($row[$field_name]['_language']) ? $row[$field_name]['_language'] : LANGUAGE_NONE;
+          unset($row[$field_name]['_language']);
+          $field_values[$language][0] = $row[$field_name];
+        }
+        else {
+          foreach ($row[$field_name] as $delta => $column_values) {
+            $language = isset($column_values['_language']) ? $column_values['_language'] : LANGUAGE_NONE;
+            unset($column_values['_language']);
+            $field_values[$language][$delta] = $column_values;
+          }
+        }
+      }
+      $entities[$entity_id]->{$field_name} = $field_values;
+    }
+  }
+}
+
+/**
+ * Implements hook_field_storage_write().
+ */
+function mongo_node_field_storage_field_storage_write($entity_type, $entity, $op, $fields, $entity_write = FALSE) {
+  if (strpos($entity_type, "rules") === 0) {
+    return;
+  }
+  $wrote = &drupal_static(__FUNCTION__, array());
+  list($entity_id, $revision_id, $bundle) = entity_extract_ids($entity_type, $entity);
+  // There is always a field_attach_insert/update call followed by an
+  // entity_insert/update. field_attach does not call storage_write needlessly
+  // so we need to make sure if the entity was not saved during field_attach,
+  // it will be during entity write. The static is set during attach write if
+  // one happened and always unset on entity write.
+  if ($entity_write) {
+    if (isset($wrote[$entity_type][$entity_id])) {
+      unset($wrote[$entity_type][$entity_id]);
+      return;
+    }
+  }
+  else {
+    $wrote[$entity_type][$entity_id] = TRUE;
+  }
+
+  // Create a new object.
+  $new_entity = new stdClass();
+  $new_entity->_id = intval($entity_id);
+  $new_entity->_type = $entity_type;
+  $new_entity->_bundle = $bundle;
+  if (isset($revision_id)) {
+    $new_entity->_revision_id = intval($revision_id);
+  }
+
+  // Add the base table's fields to the new object.
+  $entity_info = entity_get_info($entity_type);
+  if (!isset($entity_info['base table'])) {
+    return;
+  }
+
+  $table_schema = drupal_get_schema($entity_info['base table']);
+  foreach ($table_schema['fields'] as $field_name => $column_definition) {
+    if (isset($entity->$field_name)) {
+      $new_entity->$field_name = _mongo_node_field_storage_value($column_definition['type'], $entity->$field_name);
+    }
+  }
+
+  // Add the fieldapi fields to the new object.
+  foreach ($fields as $field_id) {
+    $field = field_info_field_by_id($field_id);
+    $field_name = $field['field_name'];
+    $field_values = array();
+    if (isset($entity->$field_name)) {
+      foreach ($entity->$field_name as $language => $values) {
+        // According to field.test, we should not save anything for NULL.
+        if (isset($values[0])) {
+          if ($field['cardinality'] == 1) {
+            foreach ($values[0] as $column_name => $column_value) {
+              if (isset($field['columns'][$column_name])) {
+                $field_values[$column_name] = _mongo_node_field_storage_value($field['columns'][$column_name]['type'], $column_value);
+              }
+              if ($language != LANGUAGE_NONE) {
+                $field_values['_language'] = $language;
+              }
+            }
+          }
+          else {
+            // Collapse deltas.
+            $values = array_values($values);
+            if ($field['cardinality'] > 1 && count($values) > $field['cardinality']) {
+              throw new MongodbStorageException(t('Invalid delta for @field_name, not saving @entity_type @entity_id', array('@field_name' => $field_name, '@entity_type' => $entity_type, '@entity_id' => $entity_id)));
+            }
+            foreach ($values as $delta => $column_values) {
+              $store_values = array();
+              foreach ($column_values as $column_name => $column_value) {
+                if (isset($field['columns'][$column_name])) {
+                  $store_values[$column_name] = _mongo_node_field_storage_value($field['columns'][$column_name]['type'], $column_values[$column_name]);
+                }
+              }
+              // Collapse the field structure.
+              if ($language != LANGUAGE_NONE) {
+                $store_values['_language'] = $language;
+              }
+              $field_values[] = $store_values;
+            }
+          }
+        }
+      }
+    }
+    $new_entity->$field_name = empty($field_values) ? NULL : $field_values;
+  }
+
+  // Save the object.
+  $collection = mongodb_collection('fields_current', $entity_type);
+  $collection->save($new_entity);
+
+  if (isset($revision_id)) {
+    $new_entity->_id = (int) $revision_id;
+    mongodb_collection('fields_revision', $entity_type)->save($new_entity);
+  }
+}
+
+/**
+ * Implement hook_field_storage_delete().
+ *
+ * This function deletes data for all fields for an entity from the database.
+ */
+function mongo_node_field_storage_field_storage_delete($entity_type, $entity, $fields) {
+}
+
+/**
+ * Implement hook_field_storage_delete_revision().
+ *
+ * This function actually deletes the data from the database.
+ */
+function mongo_node_field_storage_field_storage_delete_revision($entity_type, $entity, $fields) {
+}
+
+/**
+ * Implement hook_field_storage_delete_instance().
+ *
+ * This function simply marks for deletion all data associated with the field.
+ */
+function mongo_node_field_storage_field_storage_delete_instance($instance) {
+  // @todo: figure out what to do.
+}
+
+class MongoNodeStorageException extends Exception {}
+
+/**
+ * Implements hook_entity_query_alter().
+ *
+ * Alter the entity info.
+ */
+function mongo_node_field_storage_entity_query_alter($query) {
+}
+
+/**
+ * Implements hook_field_storage_query().
+ *
+ * Execute an EntityFieldQuery.
+ */
+function mongo_node_field_storage_field_storage_query($query) {
+  $find = array();
+}

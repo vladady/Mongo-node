@@ -1,0 +1,7 @@
+
+name = Mongo Node Storage
+description = Store Field content on MongoDB.
+package = MongoDB
+version = VERSION
+core = 7.x
+dependencies[] = mongodb
